@@ -1,0 +1,183 @@
+#!/usr/bin/env nix-shell
+#!nix-shell -i bash
+
+set -e
+set -u
+PS4=" $ "
+#set -x
+
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+
+# Useful GUIDs for partition types.
+
+# The ESP. cgpt knows about the ESP GUID, but let's keep this consistent.
+GUID_esp="C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
+
+# A partition type meaning "something needed to boot", used in most cases to
+# replace the "empty" space MBR had beforehand.
+# (Currently unused on AArch64)
+GUID_bios_boot="21686148-6449-6E6F-744E-656564454649"
+
+# Use this for a Linux partition like ext4.
+GUID_linux="0FC63DAF-8483-4772-8E79-3D69D8477DE4"
+
+# Use this for a Linux swap partition.
+GUID_swap="0657FD6D-A4AB-43C4-84E5-0933C84B4F4F"
+
+# Size of a sector (LBA)
+# FIXME: is 512 a constant in GPT or does it follow the "physical" LBA?
+LBA=512
+
+# Sectors in a megabyte
+mbyte="$(( 1024 * 1024 / LBA ))"
+
+DEFAULT_HOLE_SIZE=2
+
+# -----------------------------------------------------------------------------
+# Size helpers
+# -----------------------------------------------------------------------------
+
+# Gives the first usable sector in the table for $1.
+usable_start() {
+	local disk="$1"
+	shift
+
+	echo $(($(
+	cgpt show -v "$disk" | grep 'First LBA: ' | cut -d':' -f2
+	)))
+}
+
+# Gives one sector over the last usable sector of the table for $1.
+# Can be used directly for `end - start` arithmetics.
+usable_end() {
+	local disk="$1"
+	shift
+
+	# The Last LBA is the last usable LBA.
+	# `+1` gives us the start of the secondary GPT table.
+	# Without `+1` the dumb usable_end - part_start would leave
+	# 1 sector unused at the end.
+	echo $(($(
+		cgpt show -v "$disk" | grep 'Last LBA: ' | cut -d':' -f2
+	) + 1))
+}
+
+# Returns the size from the given start ($2) to the end of the usable area
+# for disk $1.
+# This assumes the last partition of the disk.
+size_to_end() {
+	local disk="$1"
+	shift
+
+	local start="$1"
+	shift
+
+	local end
+	end=$(usable_end "$disk")
+
+	echo "$(( end - start ))"
+}
+
+# Returns the next sector available for disk $1 in the usable area, starting
+# from the last defined partition.
+next_start() {
+	local disk="$1"
+	if [[ "$(cgpt show -q "$disk")" == "" ]]; then
+		usable_start "$disk"
+	else
+		cgpt show -q "$disk" | tail -n1 | awk '{print $1+$2}'
+	fi
+}
+
+# -----------------------------------------------------------------------------
+# Porcelain
+# -----------------------------------------------------------------------------
+
+cmd_help() {
+	cat <<-EOF
+holey <disk> <cmd>
+Commands:
+
+  help
+  check
+  init [size in MiB] (defaults to ${DEFAULT_HOLE_SIZE}MiB)
+  add <type> [size in MiB] (defaults to what's left)
+
+Known types:
+
+ * esp
+ * linux
+ * swap
+
+	EOF
+	exit 0
+}
+
+cmd_init() {
+	local size="${1-$DEFAULT_HOLE_SIZE}"
+	shift || :
+
+	# hole + PMBR + header
+	hole="$(( size * mbyte + 2 ))"
+
+	# Zeroes the GPTs, if it makes sense
+	cgpt create -z "$DISK"
+
+	# Creates new GPTs with space for the bootloader
+	cgpt create -p "$(( hole ))" "$DISK"
+
+	# Creates the PMBR; also makes the GPT show up in most tools.
+	cgpt boot -p "$DISK"
+}
+
+cmd_check() {
+	# Sanity check (transmit stderr)
+	if (cgpt show "$DISK" > /dev/null); then
+		echo "Holey GPT looks fine!"
+	else
+		echo "Holey GPT looks broken?"
+		exit 1
+	fi
+
+	cgpt show "$DISK"
+}
+
+cmd_add() {
+	local type
+	type=$(eval echo '$'GUID_"${1}")
+	shift
+
+	local start
+	start="$(next_start "$DISK")"
+
+	local size
+	if (($#)); then
+		size=$((${1} * mbyte ))
+		shift
+	else
+		size=$(size_to_end "$DISK" "$start")
+	fi
+
+	cgpt add "$DISK" \
+		-t "$type" \
+		-b "$start" \
+		-s "$size"
+}
+
+main() {
+	if (( $# < 2 )); then
+		cmd_help
+	fi
+
+	DISK="$1"
+	shift
+
+	cmd="cmd_$1"
+	shift
+
+	"$cmd" "$@"
+}
+
+main "$@"
